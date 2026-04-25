@@ -30,6 +30,7 @@ class EmbeddingCache:
     def _load_model(self):
         if self._model is None:
             from transformers import AutoTokenizer, AutoModel
+            print("self.lm_name: ", self.lm_name)
             self._tokenizer = AutoTokenizer.from_pretrained(self.lm_name)
             self._model = AutoModel.from_pretrained(self.lm_name)
             self._model = self._model.to(self.device)

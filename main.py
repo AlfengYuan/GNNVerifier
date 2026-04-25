@@ -10,28 +10,557 @@ import math
 import asyncio
 from openai import OpenAI
 import sys
-sys.path.append("../")
+sys.path.append("./")
 from model import ModelTrainer
 from utils_preproc import order_chain_with_steps_and_edges, clean_step_texts, edges_to_links
 from utils import init_random_state, load_test_data, get_cur_time, prepare_training_ids
-from evaluate import f1_score
+# from evaluate import f1_score
+
+# from sklearn.metrics import f1_score
+# import evaluate
+# f1 = evaluate.load("f1")
+
+# results = f1.compute(
+#     predictions=[0, 1, 1],
+#     references=[0, 1, 0]
+# )
+# 原始训练集 = split_ids中test_ids之外的所有数据
+#     │
+#     ├── 在版本2中: 进一步划分为
+#     │   ├── 90%: 实际用于后续GNN训练的数据
+#     │   └── 10%: 作为"验证集"进行LLM推理 (direct_val.json)
+#     │
+#     └── 在版本3中:
+#         ├── 90% (train_data_raw):
+#         │   ├── 构建N-gram统计
+#         │   ├── 构建混淆矩阵
+#         │   ├── 生成扰动训练样本
+#         │   ├── 训练GNN模型
+#         │   └── 预训练对齐模型
+#         │
+#         └── 10% (val_data_raw):
+#             ├── 用于GNN训练的早停验证
+#             └── 用于搜索风险阈值和接受阈值
+
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                           主入口 (main)                                  │
+# │                    ┌─────────────────────────────────┐                  │
+# │                    │  阶段0: 初始化与数据加载           │                  │
+# │                    │  • 解析命令行参数                  │                  │
+# │                    │  • 加载数据集划分 (test_ids)       │                  │
+# │                    │  • 划分训练集/验证集 (90%/10%)      │                  │
+# │                    └─────────────────────────────────┘                  │
+# │                                    │                                    │
+# │                                    ▼                                    │
+# │  ┌─────────────────────────────────────────────────────────────────┐   │
+# │  │                     阶段1: 特征工程与缓存构建                      │   │
+# │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │   │
+# │  │  │ build_io_   │  │ build_typed │  │ build_confusion_prior   │  │   │
+# │  │  │ types_vocab │  │ _ngrams     │  │ (工具混淆矩阵)            │  │   │
+# │  │  │ (IO类型词典) │  │ (N-gram统计) │  │                         │  │   │
+# │  │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │   │
+# │  │                                    │                            │   │
+# │  │                                    ▼                            │   │
+# │  │              ┌─────────────────────────────────┐                │   │
+# │  │              │  init_embedding_cache (嵌入缓存) │                │   │
+# │  │              │  • 预计算所有工具的向量表示        │                │   │
+# │  │              │  • 预计算用户请求的向量表示        │                │   │
+# │  │              └─────────────────────────────────┘                │   │
+# │  └─────────────────────────────────────────────────────────────────┘   │
+# │                                    │                                    │
+# │                                    ▼                                    │
+# │  ┌─────────────────────────────────────────────────────────────────┐   │
+# │  │                     阶段2: 模型训练与预训练                        │   │
+# │  │  ┌─────────────────────────────────────────────────────────┐    │   │
+# │  │  │  generate_perturbations_with_labels (生成训练样本)       │    │   │
+# │  │  │  • 对GT计划添加扰动（替换/删除/打乱）生成负样本           │    │   │
+# │  │  │  • 计算每个样本的代价和质量分数                          │    │   │
+# │  │  └─────────────────────────────────────────────────────────┘    │   │
+# │  │                                    │                            │   │
+# │  │                                    ▼                            │   │
+# │  │              ┌─────────────────────────────────┐                │   │
+# │  │              │  ModelTrainer.train (GNN训练)     │                │   │
+# │  │              │  • 对比学习：GT vs 扰动样本        │                │   │
+# │  │              │  • 联合优化：图分数 + 节点风险 + 间隙风险 │                │   │
+# │  │              └─────────────────────────────────┘                │   │
+# │  │                                    │                            │   │
+# │  │                    [可选] train_alignment_from_raw              │   │
+# │  │                    (步骤-工具对齐预训练)                         │   │
+# │  └─────────────────────────────────────────────────────────────────┘   │
+# │                                    │                                    │
+# │                                    ▼                                    │
+# │  ┌─────────────────────────────────────────────────────────────────┐   │
+# │  │                     阶段3: 验证集阈值搜索 (Hyperparameter Tuning) │   │
+# │  │  ┌─────────────────────────────────────────────────────────┐    │   │
+# │  │  │  Stage 3.1: search_risk_thresholds                     │    │   │
+# │  │  │  • 输入: 验证集上的直接预测结果                         │    │   │
+# │  │  │  • 输出: 最优 θ_node, θ_gap (风险阈值)                  │    │   │
+# │  │  │  • 方法: 网格搜索最大化F1                              │    │   │
+# │  │  └─────────────────────────────────────────────────────────┘    │   │
+# │  │                                    │                            │   │
+# │  │                                    ▼                            │   │
+# │  │  ┌─────────────────────────────────────────────────────────┐    │   │
+# │  │  │  Stage 3.2: stage1_candidate_thresholds                │    │   │
+# │  │  │  • 基于验证集分数分布生成T_accept候选列表                 │    │   │
+# │  │  └─────────────────────────────────────────────────────────┘    │   │
+# │  │                                    │                            │   │
+# │  │                                    ▼                            │   │
+# │  │  ┌─────────────────────────────────────────────────────────┐    │   │
+# │  │  │  Stage 3.3: stage2_search_thresholds_with_llm          │    │   │
+# │  │  │  • 对每个验证样本预计算LLM修正结果                      │    │   │
+# │  │  │  • 网格搜索最优T_accept (接受阈值)                        │    │   │
+# │  │  │  • 选择使Node-F1+Link-F1最大的阈值                      │    │   │
+# │  │  └─────────────────────────────────────────────────────────┘    │   │
+# │  └─────────────────────────────────────────────────────────────────┘   │
+# │                                    │                                    │
+# │                                    ▼                                    │
+# │  ┌─────────────────────────────────────────────────────────────────┐   │
+# │  │                     阶段4: 测试集推理 (三阶段流水线)              │   │
+# │  │                                                                 │   │
+# │  │  ┌─────────────────────────────────────────────────────────┐    │   │
+# │  │  │  Phase 1: score_one_sample (GNN评分)                    │    │   │
+# │  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐ │    │   │
+# │  │  │  │normalize_  │  │order_chain_ │  │  add_start_edge │ │    │   │
+# │  │  │  │tools_list   │  │with_steps_  │  │  (添加START节点) │ │    │   │
+# │  │  │  │(工具名规范化)│  │and_edges    │  │                 │ │    │   │
+# │  │  │  └─────────────┘  └─────────────┘  └─────────────────┘ │    │   │
+# │  │  │                          │                            │    │   │
+# │  │  │                          ▼                            │    │   │
+# │  │  │              ┌─────────────────────────┐              │    │   │
+# │  │  │              │ controller.score_chain  │              │    │   │
+# │  │  │              │ (GNN前向传播计算分数)    │              │    │   │
+# │  │  │              │ • S: 整体规划质量分数    │              │    │   │
+# │  │  │              │ • node_risks: 节点风险   │              │    │   │
+# │  │  │              │ • gap_risks: 间隙风险    │              │    │   │
+# │  │  │              └─────────────────────────┘              │    │   │
+# │  │  └─────────────────────────────────────────────────────────┘    │   │
+# │  │                                    │                            │   │
+# │  │                                    ▼                            │   │
+# │  │  ┌─────────────────────────────────────────────────────────┐    │   │
+# │  │  │  Phase 2: refine_one_sample (LLM精细化修正)            │    │   │
+# │  │  │                                                         │    │   │
+# │  │  │  ┌─────────────────────────────────────────────────┐   │    │   │
+# │  │  │  │  iterative_refine_with_llm (迭代优化核心)        │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  │  Step 1: 检查 S ≥ T_accept?                      │   │    │   │
+# │  │  │  │       Yes ──► 直接返回 (接受)                     │   │    │   │
+# │  │  │  │       No  ──► 继续优化                           │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  │  Step 2: 调用 call_llm_patch (LLM修正)           │   │    │   │
+# │  │  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────┐  │   │    │   │
+# │  │  │  │  │suggest_     │  │suggest_     │  │build_   │  │   │    │   │
+# │  │  │  │  │replacement_ │  │insertion_   │  │full_gnn │  │   │    │   │
+# │  │  │  │  │tools        │  │tools        │  │_report  │  │   │    │   │
+# │  │  │  │  │(替换候选)    │  │(插入候选)    │  │(完整报告)│  │   │    │   │
+# │  │  │  │  └─────────────┘  └─────────────┘  └─────────┘  │   │    │   │
+# │  │  │  │                          │                     │   │    │   │
+# │  │  │  │                          ▼                     │   │    │   │
+# │  │  │  │              ┌─────────────────────────┐       │   │    │   │
+# │  │  │  │              │ 构建Prompt + 调用LLM   │       │   │    │   │
+# │  │  │  │              │ robust_json_extract    │       │   │    │   │
+# │  │  │  │              │ (解析LLM返回的JSON)     │       │   │    │   │
+# │  │  │  │              └─────────────────────────┘       │   │    │   │
+# │  │  │  │                          │                     │   │    │   │
+# │  │  │  │                          ▼                     │   │    │   │
+# │  │  │  │  Step 3: parse_edit_ops (解析编辑操作)         │   │    │   │
+# │  │  │  │  Step 4: validate_edit_ops (验证合法性)        │   │    │   │
+# │  │  │  │       不合法 ──► call_llm_patch_fix (修正)     │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  │  Step 5: apply_edit_ops (应用编辑)              │   │    │   │
+# │  │  │  │  • 替换节点工具                                │   │    │   │
+# │  │  │  │  • 插入新工具到间隙                            │   │    │   │
+# │  │  │  │  • 重新生成步骤描述                            │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  │  Step 6: order_chain_with_steps_and_edges      │   │    │   │
+# │  │  │  │          (重新排序和连接)                       │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  │  Step 7: controller.score_chain (重新评分)     │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  │  Step 8: 稳定性检查 (对比GT质量不下降)          │   │    │   │
+# │  │  │  │       不稳定 ──► 回滚到初始计划                  │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  │  Step 9: 改进检查 (S' > S + DELTA_IMPROVE?)    │   │    │   │
+# │  │  │  │       未改进 ──► 回滚到初始计划                  │   │    │   │
+# │  │  │  │       已改进 ──► 接受新计划                     │   │    │   │
+# │  │  │  │                                                 │   │    │   │
+# │  │  │  └─────────────────────────────────────────────────┘   │    │   │
+# │  │  │                                                         │    │   │
+# │  │  │  [并发控制: asyncio.Semaphore(args.multiworker)]        │    │   │
+# │  │  └─────────────────────────────────────────────────────────┘    │   │
+# │  │                                    │                            │   │
+# │  │                                    ▼                            │   │
+# │  │  ┌─────────────────────────────────────────────────────────┐    │   │
+# │  │  │  Phase 3: 评估 (compute_f1_set_based)                    │    │   │
+# │  │  │  • Direct vs Refined 对比                               │    │   │
+# │  │  │  • 输出: Node-F1, Link-F1, Accuracy                     │    │   │
+# │  │  └─────────────────────────────────────────────────────────┘    │   │
+# │  │                                                                 │   │
+# │  └─────────────────────────────────────────────────────────────────┘   │
+# │                                                                         │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+# 本项目是一个基于 GNN（图神经网络）评估与 LLM（大语言模型）迭代修正的任务规划优化系统。
+# 下面以具体案例为例，详细拆解各大模块的输入、输出及数据形态。
+#
+# 【案例背景】
+# ID: "10819379"
+# User Request: "I have an image 'example.jpg' and want to change its background color to blue. Then, I'd like to estimate the depth of the objects in the edited image and classify the depth map as a table. Based on the classification, I want a text description to be generated and finally, create a video from this text."
+#
+# =================================================================================================
+# 模块一：初始化与特征工程 (Initialization & Feature Engineering)
+# =================================================================================================
+# 作用：构建工具知识库、预计算嵌入向量、统计工具共现规律，为GNN和LLM提供底层支持。
+#
+# 1. build_io_types_vocab (IO类型词典构建)
+#    - 输入: tool_meta (工具元数据，包含每个工具的 input-type/output-type)
+#    - 输出: IO_TYPES (所有可能的IO类型列表), IO_TYPE2IDX (类型到索引的映射)
+#    - 示例: {"image": 0, "text": 1, "depth_map": 2, ...}
+#
+# 2. build_typed_ngrams (N-gram 统计构建)
+#    - 输入: train_data_raw (训练集原始数据), tool_meta
+#    - 输出: typed_ngrams (字典，记录工具对或工具三元组的共现频率)
+#    - 示例: {"__f2__": {("load_image", "change_background"): 150, ("change_background", "estimate_depth"): 80}}
+#
+# 3. build_confusion_prior (工具混淆矩阵/候选生成器)
+#    - 输入: tool_meta, embedding_cache
+#    - 输出: confusion (字典，记录每个工具易混淆的其他工具及其相似度分数)
+#    - 示例: {"load_image": [("load_video", 0.85), ("read_text_file", 0.60)], ...}
+#
+# 4. init_embedding_cache (嵌入缓存初始化)
+#    - 输入: tool_meta, lm_name (如 'intfloat/e5-large')
+#    - 输出: embedding_cache (对象，存储所有工具描述和用户请求的向量表示)
+#    - 示例: cache._tool_embeddings["change_background"] -> [0.12, -0.45, ..., 0.88] (768维向量)
+#
+# =================================================================================================
+# 模块二：模型训练 (Model Training) - 离线阶段
+# =================================================================================================
+# 作用：训练GNN模型，使其能够评估任务规划的质量（整体分数S、节点风险、间隙风险）。
+#
+# 1. generate_perturbations_with_labels (生成对比学习样本)
+#    - 输入: 单个训练样本 ex (含GT计划), confusion, typed_ngrams
+#    - 输出: train_items (列表，包含正样本GT和负样本Perturbed)
+#    - 示例 Item:
+#      {
+#        "tools": ["load_image", "change_background", "estimate_depth"],
+#        "edges": [(0,1), (1,2)],
+#        "y_cons": 1.0, # GT标签
+#        "node_risk": [0.1, 0.1, 0.1],
+#        "is_gt": True
+#      }
+#      {
+#        "tools": ["load_image", "read_text_file", "estimate_depth"], # 错误替换
+#        "edges": [(0,1), (1,2)],
+#        "y_cons": 0.2, # 低分标签
+#        "node_risk": [0.1, 0.9, 0.1], # 中间节点高风险
+#        "is_gt": False
+#      }
+#
+# 2. ModelTrainer.train (GNN训练)
+#    - 输入: train_items, val_items
+#    - 输出: best_model (训练好的GNN权重)
+#    - 内部机制: 最小化对比损失，使GT计划的得分S高于扰动计划，同时预测准确的节点/间隙风险。
+#
+# =================================================================================================
+# 模块三：阈值搜索 (Threshold Search) - 验证集阶段
+# =================================================================================================
+# 作用：确定两个关键阈值：风险阈值 (theta_node/gap) 和 接受阈值 (T_accept)。
+#
+# 1. search_risk_thresholds
+#    - 输入: val_ids, val_content (验证集直接预测结果), controller (GNN模型)
+#    - 输出: theta_node (节点风险阈值, e.g., 0.6), theta_gap (间隙风险阈值, e.g., 0.5)
+#    - 逻辑: 网格搜索，寻找使“高风险节点/间隙”与“真实错误节点/间隙”F1分数最大的阈值。
+#
+# 2. stage2_search_thresholds_with_llm
+#    - 输入: val_ids, thresholds候选列表, controller, tool_meta等
+#    - 输出: T_accept (接受阈值, e.g., 0.85)
+#    - 逻辑: 模拟推理过程。如果GNN评分 S >= T_accept，则直接接受；否则调用LLM修正。
+#           选择使最终 Node-F1 + Link-F1 最大的 T_accept。
+#
+# =================================================================================================
+# 模块四：测试集推理 (Inference Pipeline) - 在线阶段
+# =================================================================================================
+# 针对案例 ID "10819379" 的详细流转：
+#
+# --- Phase 1: GNN 评分 (Score One Sample) ---
+# 1. 数据准备:
+#    - 用户请求: "I have an image 'example.jpg'..."
+#    - 直接预测计划 (Direct Plan, 来自LLM基线):
+#      nodes: ["load_image", "change_background", "estimate_depth", "classify_table", "generate_text", "create_video"]
+#      steps: ["Load example.jpg", "Change bg to blue", "Estimate depth", "Classify depth map", "Generate description", "Create video"]
+#      edges: [(0,1), (1,2), (2,3), (3,4), (4,5)]
+#
+# 2. 预处理:
+#    - normalize_tools_list: 规范化工具名 (处理别名)
+#    - order_chain_with_steps_and_edges: 确保节点顺序与边一致
+#    - add_start_edge: 添加虚拟起点 (0, 1) -> (START, load_image)
+#
+# 3. GNN 前向传播 (controller.score_chain):
+#    - 输入: nodes, user_request, edges, step_texts
+#    - 输出:
+#      {
+#        "S": 0.72,              # 整体质量分数 (假设低于 T_accept=0.85，需修正)
+#        "node_risks": [0.1, 0.1, 0.8, 0.2, 0.1, 0.1], # estimate_depth 风险高? 或者 classify_table 风险高?
+#        "gap_risks": [0.1, 0.1, 0.6, 0.1, 0.1],       # gap between depth and classify 风险高
+#        "gaps": [(2,3), ...]    # 高风险间隙索引
+#      }
+#
+# --- Phase 2: LLM 精细化修正 (Refine One Sample) ---
+# 核心函数: iterative_refine_with_llm
+#
+# 1. 判断是否接受:
+#    - S (0.72) < T_accept (0.85) -> 进入修正流程
+#
+# 2. 候选生成 (Candidate Generation):
+#    A. 高风险节点分析 (Node Risk > theta_node):
+#       - 假设 Node 2 ("estimate_depth") 风险高。
+#       - suggest_replacement_tools:
+#         - 输入: current_tool="estimate_depth", context=request+steps
+#         - 逻辑: 查混淆矩阵 + IO兼容检查 + 语义相似度
+#         - 输出: [{"tool": "compute_depth_map", "score": 0.9}, {"tool": "monocular_depth_estimation", "score": 0.85}]
+#
+#    B. 高风险间隙分析 (Gap Risk > theta_gap):
+#       - 假设 Gap (2->3) ("estimate_depth" -> "classify_table") 风险高。
+#       - suggest_insertion_tools:
+#         - 输入: u="estimate_depth", v="classify_table"
+#         - 逻辑: 查N-gram共现 + IO桥接 (depth_map output -> table input?)
+#         - 输出: [{"tool": "convert_to_grayscale", "score": 0.7}, {"tool": "normalize_depth", "score": 0.8}]
+#
+# 3. 构建 Prompt 并调用 LLM (call_llm_patch):
+#    - Prompt 内容:
+#      - User Request
+#      - Current Plan (JSON)
+#      - GNN Diagnosis: "Node 2 has high risk (0.8). Gap 2->3 has high risk (0.6)."
+#      - Candidates: "Node 2 candidates: [compute_depth_map, ...]; Gap 2->3 candidates: [normalize_depth, ...]"
+#      - Instruction: "Output JSON edits only."
+#
+#    - LLM 输出 (LLM Output):
+#      {
+#        "edits": [
+#          {"op": "replace_node", "node_id": 2, "candidate_id": 0, "step": "Step 3: Compute precise depth map using monocular estimation"},
+#          {"op": "insert_on_gap", "gap_id": 0, "candidate_id": 1, "step": "Step 4: Normalize the depth values for classification"}
+#        ]
+#      }
+#
+# 4. 解析与验证 (Parse & Validate):
+#    - parse_edit_ops: 解析JSON为操作列表
+#    - validate_edit_ops: 检查ID合法性、无重复工具、步骤非空
+#
+# 5. 应用编辑 (Apply Edits):
+#    - apply_edit_ops:
+#      - 替换 Node 2: "estimate_depth" -> "compute_depth_map"
+#      - 插入新节点: 在 Node 2 和 3 之间插入 "normalize_depth"
+#      - 重新生成 Steps 和 Edges
+#    - 新计划 (New Plan):
+#      nodes: ["load_image", "change_background", "compute_depth_map", "normalize_depth", "classify_table", "generate_text", "create_video"]
+#
+# 6. 重新评分与稳定性检查 (Re-score & Check):
+#    - controller.score_chain(New Plan) -> New_S
+#    - 假设 New_S = 0.88
+#    - 改进检查: New_S (0.88) > Old_S (0.72) + DELTA_IMPROVE (0.02) ? Yes.
+#    - 稳定性检查: 如果有GT，检查F1是否下降。若无GT或F1未降，则接受。
+#
+# 7. 返回结果:
+#    - Refined Plan: 上述新计划
+#    - Strategy: "patch"
+#
+# --- Phase 3: 评估 (Evaluation) ---
+# 1. 计算指标:
+#    - Node-F1: 比较 Refined Nodes 与 GT Nodes (集合交集/并集)
+#    - Link-F1: 比较 Refined Edges 与 GT Edges
+#    - Accuracy: Node-F1 > 0.99 AND Link-F1 > 0.99
+#
+# 2. 输出示例:
+#    | Dataset | Method          | N-F1   | L-F1   | Accuracy |
+#    |---------|-----------------|--------|--------|----------|
+#    | huggingface | Direct      | 0.7500 | 0.6800 | 0.45     |
+#    | huggingface | Direct+LLM_Refined | 0.8200 | 0.7800 | 0.62     |
+#
+# =================================================================================================
+
+
+# 核心函数流转详细说明
+# 第一层：初始化与特征工程
+# 函数	输入	输出	主要作用
+# prepare_training_ids	dataset, train_num, test_ids	train_ids	从非测试数据中采样训练ID
+# build_io_types_vocab	tool_meta	IO_TYPES, IO_TYPE2IDX	构建IO类型词典
+# build_typed_ngrams	train_data, tool_meta	typed_ngrams	统计工具共现频率
+# build_confusion_prior	tool_meta, embedding_cache	confusion	构建工具混淆矩阵
+# init_embedding_cache	tool_meta, lm_name	embedding_cache	预计算所有嵌入向量
+
+# 第二层：模型训练
+# 函数	输入	输出	主要作用
+# generate_perturbations_with_labels	train_data, confusion, typed_ngrams	train_items	生成对比学习样本（GT + 扰动）
+# ModelTrainer.train	train_items, val_items	best_model	GNN对比学习训练
+# train_alignment_from_raw	train_data	align_proj	步骤-工具语义对齐预训练
+
+# 第三层：阈值搜索（验证集）
+# 函数	输入	输出	主要作用
+# load_test_data	dataset, method='direct_val'	val_content	加载验证集预测结果
+# search_risk_thresholds	val_ids, val_content, controller	θ_node, θ_gap	搜索最优风险阈值
+# stage1_candidate_thresholds	val_stats	candidate_T_accept	生成接受阈值候选
+# stage2_search_thresholds_with_llm	val_ids, val_content, thresholds	best_T_accept	搜索最优接受阈值
+# 第四层：测试推理（核心流水线）
+# Phase 1: GNN评分
+# 函数	输入	输出	主要作用
+# normalize_tools_list	pred_nodes, alias_map	normalized_nodes	规范化工具名称
+# order_chain_with_steps_and_edges	nodes, steps, links	ordered_nodes, ordered_steps, edges	排序节点和边
+# add_start_edge	edges, num_nodes	edges_with_start	添加虚拟START节点
+# controller.score_chain	nodes, user_request, edges, steps	{S, node_risks, gap_risks, gaps}	GNN前向传播
+# Phase 2: LLM精细化修正
+# 函数	输入	输出	主要作用
+# iterative_refine_with_llm	init_plan, init_gnn, thresholds	refined_plan, strategy, history	迭代优化主控
+# suggest_replacement_tools	controller, node_idx, current_plan	candidates	为高风险节点找替换候选
+# suggest_insertion_tools	controller, gap_pos, typed_ngrams	candidates	为高风险间隙找插入候选
+# build_full_gnn_report	gnn_result, current_plan	report	构建完整GNN诊断报告
+# call_llm_patch	user_request, tool_meta, candidates, gnn_report	llm_output	调用LLM生成编辑操作
+# parse_edit_ops	llm_output	ops	解析编辑操作
+# validate_edit_ops	ops, node_candidates, gap_candidates	is_valid, errors	验证操作合法性
+# call_llm_patch_fix	error_msg, candidates	fixed_output	LLM修正错误操作
+# apply_edit_ops	plan, ops, candidates	new_plan	应用编辑生成新计划
+# compute_f1_set_based	pred_list, gt_list	f1_score	计算F1评估指标
+
+# 关键数据流转
+# 用户请求 ──┬──► embedding_cache ──► 请求向量
+#           │
+#           ├──► 直接预测结果 (nodes, steps, links)
+#           │         │
+#           │         ▼
+#           │    GNN评分 (score_chain)
+#           │    ├──► S (整体质量分数)
+#           │    ├──► node_risks[] (每个节点的风险)
+#           │    └──► gap_risks[] (每个间隙的风险)
+#           │         │
+#           │    S < T_accept? ──Yes──► LLM修正流程
+#           │         │
+#           │    No (直接接受)
+#           │         │
+#           ▼         ▼
+#     ┌─────────────────────────┐
+#     │  高风险节点 ──► suggest_replacement_tools ──► 替换候选列表
+#     │  高风险间隙 ──► suggest_insertion_tools ──► 插入候选列表
+#     └─────────────────────────┘
+#                 │
+#                 ▼
+#         ┌─────────────────┐
+#         │  构建Prompt (包含GNN诊断 + 候选工具) │
+#         │  call_llm_patch   │
+#         └─────────────────┘
+#                 │
+#                 ▼
+#         LLM生成编辑操作 (replace_node / insert_on_gap)
+#                 │
+#                 ▼
+#         ┌─────────────────┐
+#         │  验证 ──► 应用 ──► 重新评分 ──► 检查改进  │
+#         │  validate ──► apply ──► score ──► check   │
+#         └─────────────────┘
+#                 │
+#         改进足够? ──Yes──► 接受新计划
+#                 │
+#                No ──► 回滚到初始计划
+#
+# 并发控制机制
+# ┌─────────────────────────────────────────┐
+# │  asyncio.Semaphore(args.multiworker)    │
+# │  限制并发数（默认4个并发）                 │
+# │                                         │
+# │  async def score_one_async(data_id):    │
+# │      async with sem:                    │
+# │          loop.run_in_executor(None, score_one_sample, data_id) │
+# │                                         │
+# │  tasks = [score_one_async(id) for id in test_ids] │
+# │  asyncio.gather(*tasks)  # 并发执行      │
+# └─────────────────────────────────────────┘
+#
+# 缓存机制
+# 缓存类型	用途	实现
+# _IO_CACHE	IO类型映射缓存	全局字典
+# embedding_cache	工具/请求向量缓存	磁盘 + 内存
+# llm_cache	LLM调用结果缓存	字典 (prompt_hash → result)
+# typed_ngrams	N-gram统计缓存	JSON文件
+# confusion	混淆矩阵缓存	JSON文件
+
+
+
+
+# 在文件顶部添加这个自定义 F1 计算函数
+def compute_f1_set_based(pred_list, gt_list):
+    """
+    基于集合的 F1 计算（忽略顺序）
+    适用于工具节点和链接的评估
+    """
+    if not isinstance(pred_list, list):
+        pred_list = list(pred_list) if pred_list else []
+    if not isinstance(gt_list, list):
+        gt_list = list(gt_list) if gt_list else []
+
+    # 转换为集合
+    pred_set = set(pred_list)
+    gt_set = set(gt_list)
+
+    # 计算 TP, FP, FN
+    tp = len(pred_set & gt_set)  # 交集
+    fp = len(pred_set - gt_set)  # 预测有但真实没有
+    fn = len(gt_set - pred_set)  # 真实有但预测没有
+
+    # 计算精确率、召回率、F1
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return f1
+
+# 基于集合的F1计算
+# 计算预测结果与真实结果的F1分数，不考虑元素顺序
+# 将列表转换为集合
+# 计算TP（真正例：交集）、FP（假正例：预测有但真实没有）、FN（假负例：真实有但预测没有）
+# 计算Precision = TP/(TP+FP)，Recall = TP/(TP+FN)
+# F1 = 2PrecisionRecall/(Precision+Recall)
+def compute_f1_sequence_based(pred_list, gt_list):
+    """
+    基于序列的 F1 计算（考虑顺序，使用 LCS-like 方法）
+    如果需要严格顺序匹配，可以使用此方法
+    """
+    if not isinstance(pred_list, list):
+        pred_list = list(pred_list) if pred_list else []
+    if not isinstance(gt_list, list):
+        gt_list = list(gt_list) if gt_list else []
+
+    # 使用集合方法计算（如果你需要顺序敏感，需要更复杂的算法）
+    # 这里使用简单的精确匹配计数
+    pred_set = set(pred_list)
+    gt_set = set(gt_list)
+
+    tp = sum(1 for p in pred_list if p in gt_set)
+    fp = sum(1 for p in pred_list if p not in gt_set)
+    fn = sum(1 for g in gt_list if g not in pred_set)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return f1
 
 _api_key = os.environ.get("OPENAI_API_KEY")
 _api_base_url = os.environ.get("OPENAI_API_BASE")
 client = OpenAI(api_key=_api_key, base_url=_api_base_url)
 
-TAU_ACCEPT = 0.9
-DELTA_IMPROVE = 0.02
-THETA_NODE = 0.5
-THETA_GAP = 0.5
-_IO_CACHE = {}
-LLM_MAX_RETRIES = 5
-LLM_RETRY_BASE_SEC = 1.0
-LLM_RETRY_MAX_SEC = 10.0
-LLM_MIN_INTERVAL_SEC = 0.5
-_LLM_LAST_CALL_TS = 0.0
 
+# 核心阈值参数
+TAU_ACCEPT = 0.9           # 接受阈值：GNN分数≥此值直接接受
+DELTA_IMPROVE = 0.02       # 改进阈值：新计划必须比原计划好至少此值
+THETA_NODE = 0.5           # 节点风险阈值（默认）
+THETA_GAP = 0.5            # 间隙风险阈值（默认）
 
+_IO_CACHE = {}             # IO类型缓存
+LLM_MAX_RETRIES = 5        # LLM最大重试次数
+LLM_RETRY_BASE_SEC = 1.0   # LLM重试基础等待时间
+LLM_RETRY_MAX_SEC = 10.0   # LLM重试最大等待时间
+LLM_MIN_INTERVAL_SEC = 0.5 # LLM调用最小间隔
+_LLM_LAST_CALL_TS = 0.0    # 上次LLM调用时间戳
+
+# LLM调用限流
 def _throttle_llm_calls():
     global _LLM_LAST_CALL_TS
     now = time.time()
@@ -64,7 +593,10 @@ def _safe_int(v, default=-1):
             return default
     return default
 
-
+# 解析编辑操作
+# no_change / revert / keep_plan：不做修改
+# replace_node(node_id, candidate_id)：替换节点工具
+# insert_on_gap(gap_id, candidate_id)：在间隙插入新工具
 def parse_edit_ops(llm_output):
     if not llm_output:
         return []
@@ -108,7 +640,12 @@ def parse_edit_ops(llm_output):
                 continue
     return ops
 
-
+# 验证编辑操作合法性
+# 最多3个操作
+# 节点ID必须在候选列表中
+# 候选ID必须在有效范围内
+# 不能重复使用同一个工具
+# 每个操作必须有对应的步骤描述
 def validate_edit_ops(ops, node_candidates, gap_candidates):
     errors = []
     if not ops:
@@ -159,7 +696,11 @@ def validate_edit_ops(ops, node_candidates, gap_candidates):
             errors.append(f"unknown_op:{op.get('op')}")
     return len(errors) == 0, errors
 
-
+# 应用编辑操作
+# 分离替换操作和插入操作
+# 按顺序执行替换操作（更新节点工具和步骤）
+# 按位置排序执行插入操作（在指定间隙插入新节点）
+# 重新生成步骤描述和边连接
 def apply_edit_ops(plan, ops, node_candidates, gap_candidates, tool_meta):
     if not ops or any(op.get("op") == "no_change" for op in ops):
         return plan
@@ -362,7 +903,16 @@ def add_start_edge(edges_tool_idx, num_nodes):
         edges_gnn.insert(0, (0, root_idx + 1))
     return edges_gnn
 
-
+# 建议替换工具
+# 从混淆矩阵中获取与当前工具易混淆的候选
+# IO兼容性检查：候选工具的输入类型必须与前驱工具的输出类型兼容
+# 计算多维度相似度分数：
+#
+#     对齐分数（如果有预训练对齐模型）
+#     步骤-工具相似度（余弦相似度）
+#     请求-工具相似度
+#
+# 返回Top-N候选及其理由
 def suggest_replacement_tools(controller, tool_meta, confusion, current_nodes, current_steps,
                                node_idx, user_request="", topn=3):
     if node_idx < 0 or node_idx >= len(current_nodes):
@@ -456,7 +1006,11 @@ def suggest_replacement_tools(controller, tool_meta, confusion, current_nodes, c
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:topn]
 
-
+# 建议插入工具
+# IO桥接检查：候选工具的输入与前驱输出兼容，输出与后继输入兼容
+# N-gram统计：利用训练数据中的工具共现频率
+# 计算综合分数：60%请求相似度 + 20%前驱N-gram + 20%后继N-gram
+# 根据间隙风险调整分数
 def suggest_insertion_tools(controller, tool_meta, typed_ngrams, current_nodes, 
                             gap_u_pos, gap_v_pos, user_request, gap_risk=0.0, topn=3):
     if gap_v_pos < 0 or gap_v_pos >= len(current_nodes):
@@ -623,7 +1177,21 @@ def robust_json_extract(text):
     except:
         return None
 
-
+# 调用LLM进行计划修正（核心函数）
+# Prompt构建流程：
+#
+#     构建工具列表字符串
+#     格式化当前计划（节点、步骤、链接）
+#     提取高风险节点和间隙，生成候选工具
+#     构建完整的GNN评估报告
+#     组合成结构化Prompt发送给LLM
+#
+# 关键设计：
+#
+#     提供详细的GNN诊断信息（分数、风险值）
+#     明确候选工具列表（限制LLM选择范围）
+#     强制JSON输出格式
+#     支持缓存机制避免重复调用
 def call_llm_patch(user_request, tool_meta, confusion, typed_ngrams, controller,
                    current_plan, gnn_result,
                    theta_node=THETA_NODE, theta_gap=THETA_GAP,
@@ -849,7 +1417,7 @@ If the current workflow is already optimal, return: {{"edits":[]}}
         time.sleep(min(LLM_RETRY_BASE_SEC * (2 ** (attempt - 1)), LLM_RETRY_MAX_SEC))
     return None
 
-
+# 功能：在初次生成的编辑操作不合法时，用错误信息提示LLM重新生成
 def call_llm_patch_fix(user_request, error_msg, node_candidates, gap_candidates,
                        temperature=0.2, max_tokens=600):
     prompt = f"""# USER REQUEST #
@@ -892,7 +1460,26 @@ Or {{\"edits\":[]}} / no_change().
         time.sleep(min(LLM_RETRY_BASE_SEC * (2 ** (attempt - 1)), LLM_RETRY_MAX_SEC))
     return None
 
-
+# 迭代优化（核心流程）
+# ┌─────────────────────────────────────────┐
+# │  初始计划 (init_plan)                   │
+# │  GNN评分 S                              │
+# │  S ≥ TAU_ACCEPT? ──Yes──► 直接接受      │
+# │      │                                  │
+# │     No                                  │
+# │      ▼                                  │
+# │  LLM分析高风险节点/间隙                   │
+# │  生成编辑操作 (replace/insert)          │
+# │  验证并应用编辑                         │
+# │  重新排序和连接边                       │
+# │  GNN重新评分 S'                         │
+# │  稳定性检查 (对比GT质量不下降)            │
+# │  S' > S + DELTA_IMPROVE? ──Yes──► 接受  │
+# │      │                                  │
+# │     No                                  │
+# │      ▼                                  │
+# │  回滚到初始计划 (rollback)               │
+# └─────────────────────────────────────────┘
 def iterative_refine_with_llm(controller, user_request, init_plan, init_gnn,
                                   tool_meta, confusion, typed_ngrams, allowed_tools,
                                   threshold_accept=TAU_ACCEPT,
@@ -983,8 +1570,8 @@ def iterative_refine_with_llm(controller, user_request, init_plan, init_gnn,
 
     quality_before = quality_after = None
     if gt_nodes is not None and gt_links is not None:
-        quality_before = f1_score(best_plan.get("nodes", []), gt_nodes)
-        quality_after = f1_score(new_plan.get("nodes", []), gt_nodes)
+        quality_before = compute_f1_set_based(best_plan.get("nodes", []), gt_nodes)
+        quality_after = compute_f1_set_based(new_plan.get("nodes", []), gt_nodes)
 
     stability_ok = True
     if quality_before is not None and quality_after is not None:
@@ -1043,7 +1630,8 @@ def _f1_binary(y_true, y_pred):
         return 0.0
     return 2 * precision * recall / (precision + recall)
 
-
+# 搜索最优风险阈值
+# 方法：网格搜索（0.1到0.9，步长0.05），最大化F1分数
 def search_risk_thresholds(val_ids, val_content, controller, t_accept,
                            alias_map=None):
     node_risks_all = []
@@ -1135,7 +1723,11 @@ def search_risk_thresholds(val_ids, val_content, controller, t_accept,
         "gap_samples": len(gap_risks_all)
     }
 
-
+# 搜索最优接受阈值
+# 优化策略：
+#     对每个验证样本，预计算LLM修正后的计划
+#     网格搜索不同的T_accept阈值
+#     选择使Node-F1和Link-F1平均值最大的阈值
 def stage2_search_thresholds_with_llm(val_ids, val_content, controller, tool_meta, confusion,
                                       typed_ngrams, allowed_tools, thresholds,
                                       max_samples=None, alias_map=None, base_t=None,
@@ -1249,8 +1841,8 @@ def stage2_search_thresholds_with_llm(val_ids, val_content, controller, tool_met
                 final_plan, _ = patch_cache.get(data_id, ({"nodes": pred_tools, "edges": pred_edges_tool}, None))
 
             pred_links = edges_to_links(final_plan.get("nodes", []), final_plan.get("edges", []))
-            node_f1 = f1_score(final_plan.get("nodes", []), gt_nodes_raw)
-            link_f1 = f1_score(pred_links, gt_links)
+            node_f1 = compute_f1_set_based(final_plan.get("nodes", []), gt_nodes_raw)
+            link_f1 =compute_f1_set_based(pred_links, gt_links)
             node_f1_list.append(node_f1)
             link_f1_list.append(link_f1)
 
@@ -1266,7 +1858,76 @@ def stage2_search_thresholds_with_llm(val_ids, val_content, controller, tool_met
         return base_t
     return best_t
 
+# | 阶段       | 功能                   | 关键操作                                                              |
+# | -------- | -------------------- | ----------------------------------------------------------------- |
+# | **数据准备** | 加载数据集，划分训练/验证集       | `prepare_training_ids()`, 10%验证集                                  |
+# | **特征工程** | 构建N-gram统计、混淆矩阵、IO类型 | `build_typed_ngrams()`, `build_confusion_prior()`                 |
+# | **模型训练** | GNN模型训练（对比学习）        | `ModelTrainer.train()`                                            |
+# | **阈值搜索** | 在验证集上搜索最优阈值          | `search_risk_thresholds()`, `stage2_search_thresholds_with_llm()` |
+# | **测试推理** | 三阶段推理流程              | 见下                                                                |
 
+# Phase 1: GNN评分
+#     └── 对所有直接预测结果用GNN打分
+#     └── 记录节点风险、间隙风险、总分S
+#
+# Phase 2: LLM精细化修正
+#     └── S < T_accept 的样本调用 iterative_refine_with_llm()
+#     └── 生成修正后的计划
+#
+# Phase 3: 评估
+#     └── 对比 Direct vs Refined 的 Node-F1, Link-F1, Accuracy
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │                         输入层                              │
+# │  用户请求 + 候选工具列表 + 直接预测结果（LLM生成）              │
+# └─────────────────────────────────────────────────────────────┘
+#                               ▼
+# ┌─────────────────────────────────────────────────────────────┐
+# │                      GNN评估层 (ModelTrainer)               │
+# │  • 图神经网络评分 S ∈ [0,1]                                  │
+# │  • 节点风险 node_risks（工具选择是否正确）                    │
+# │  • 间隙风险 gap_risks（是否需要插入新工具）                   │
+# └─────────────────────────────────────────────────────────────┘
+#                               ▼
+#                     ┌─────────────────┐
+#               S ≥ TAU_ACCEPT?          No
+#                     │                   │
+#                    Yes                  ▼
+#                     │           ┌─────────────────┐
+#                     │           │   候选生成模块   │
+#                     │           │ • 替换候选：IO兼容+相似度 │
+#                     │           │ • 插入候选：N-gram+IO桥接 │
+#                     │           └─────────────────┘
+#                     │                   │
+#                     ▼                   ▼
+#             ┌─────────────┐     ┌─────────────────┐
+#             │   直接接受    │     │   LLM修正模块    │
+#             └─────────────┘     │ • 分析GNN诊断    │
+#                                 │ • 选择候选工具    │
+#                                 │ • 生成编辑操作    │
+#                                 └─────────────────┘
+#                                         │
+#                                         ▼
+#                                 ┌─────────────────┐
+#                                 │   应用编辑操作   │
+#                                 │ • 替换节点      │
+#                                 │ • 插入间隙      │
+#                                 └─────────────────┘
+#                                         │
+#                                         ▼
+#                                 ┌─────────────────┐
+#                                 │   重新GNN评分    │
+#                                 │ 稳定性检查       │
+#                                 │ 质量改进检查     │
+#                                 └─────────────────┘
+
+# | 组件         | 创新                       |
+# | ---------- | ------------------------ |
+# | **GNN评估器** | 学习规划的结构质量，识别错误工具和缺失步骤    |
+# | **LLM修正器** | 利用LLM的推理能力，在有限候选空间内做决策   |
+# | **IO兼容性**  | 利用工具的输入输出类型约束，减少搜索空间     |
+# | **对齐预训练**  | 学习步骤文本与工具描述的语义对齐         |
+# | **两阶段阈值**  | 分离风险阈值（F1优化）和接受阈值（端到端优化） |
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -1275,16 +1936,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     # Dataset and training
-    parser.add_argument('--dataset', type=str, default='huggingface', choices=['huggingface', 'multimedia', 'dailylife', 'tmdb', 'ultratool'])
+    parser.add_argument('--dataset', type=str, default='ultratool', choices=['huggingface', 'multimedia', 'dailylife', 'tmdb', 'ultratool'])
     parser.add_argument('--train_num', type=int, default=3000)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=2e-5)
+    parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--epoch', type=int, default=10)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--lambda_rank', type=float, default=1.0)
     parser.add_argument('--margin_rank', type=float, default=0.2)
-    parser.add_argument('--lambda_graph', type=float, default=1.0)
-    parser.add_argument('--lambda_gap', type=float, default=0.5)
+    parser.add_argument('--lambda_graph', type=float, default=2.0)
+    parser.add_argument('--lambda_gap', type=float, default=1.5)
     
     # LM related
     parser.add_argument('--lm_name', type=str, default='intfloat/e5-large')
@@ -1293,7 +1954,7 @@ if __name__ == "__main__":
     parser.add_argument('--gnn_layer', type=int, default=3)
 
     parser.add_argument('--llm_temperature', type=float, default=0.2)
-    parser.add_argument('--llm_name', type=str, default='gpt-3.5-turbo',
+    parser.add_argument('--llm_name', type=str, default='deepseek-chat',
                         help="Prediction folder name and refinement LLM model name.")
 
     # Step-tool alignment pretrain
@@ -1301,7 +1962,7 @@ if __name__ == "__main__":
     parser.add_argument('--align_lr', type=float, default=1e-4)
     parser.add_argument('--align_dim', type=int, default=1024)
     parser.add_argument('--align_tau', type=float, default=0.07)
-    parser.add_argument('--cost_tau', type=float, default=0.8)
+    parser.add_argument('--cost_tau', type=float, default=0.6)
     parser.add_argument('--align_hard_k', type=int, default=5)
     parser.add_argument('--align_rand_k', type=int, default=5)
     parser.add_argument('--align_batch', type=int, default=64)
@@ -1325,9 +1986,9 @@ if __name__ == "__main__":
     LLM_NAME = args.llm_name
     device = torch.device(args.device)
     
-    split_info = json.load(open(f"../data/{args.dataset}/split_ids.json", 'r'))
+    split_info = json.load(open(f"./data/{args.dataset}/split_ids.json", 'r'))
     test_ids_set = set(split_info["test_ids"]["chain"])
-    data_file = f"../data/{args.dataset}/data.json"
+    data_file = f"./data/{args.dataset}/data.json"
     train_ids = prepare_training_ids(
         args.dataset,
         train_num=args.train_num,
@@ -1351,9 +2012,9 @@ if __name__ == "__main__":
     val_ids_set = set(ex["id"] for ex in val_data_raw)
     print(f"[Training Data] Train={len(train_data_raw)}, Val={len(val_data_raw)}")
 
-    tool_meta = json.load(open(f"../data/{args.dataset}/tool_desc.json", 'r'))
-    graph_meta = json.load(open(f"../data/{args.dataset}/graph_desc.json", 'r'))
-    alias_map_graph = _build_tool_alias_map_from_nodes(graph_meta.get("nodes", []))
+    tool_meta = json.load(open(f"./data/{args.dataset}/tool_desc.json", 'r'))
+    graph_meta = json.load(open(f"./data/{args.dataset}/graph_desc.json", 'r'))
+    alias_map_graph = _build_tool_alias_map_from_nodes(graph_meta.get("nodes", []))  #这两个函数的作用是构建工具名称的规范化映射（别名映射），用于处理工具名称的大小写和格式不一致问题。
     all_tool_names = [node["id"] for node in tool_meta["nodes"]]
     allowed_tools_set = set(all_tool_names)
     print(f"[GCM] Tool list ({len(all_tool_names)})")
@@ -1365,7 +2026,7 @@ if __name__ == "__main__":
         cache_dir=f"./outputs/{args.dataset}/embedding_cache",
         device=args.device,
         lm_name=args.lm_name
-    )
+    )#这个函数的作用是初始化并预计算工具描述的嵌入向量缓存，用于后续快速检索工具语义相似度。
 
     from utils_preproc import (
         build_io_types_vocab,
@@ -1554,8 +2215,8 @@ if __name__ == "__main__":
         gt_links = edges_to_links(gt_tools, gt_edges_tool)
         pred_links = edges_to_links(pred_tools, pred_edges_tool)
         
-        node_f1 = f1_score(pred_tools, gt_tools)
-        link_f1 = f1_score(pred_links, gt_links)
+        node_f1 = compute_f1_set_based(pred_tools, gt_tools)
+        link_f1 = compute_f1_set_based(pred_links, gt_links)
         
         val_stats.append({
             "id": data_id,
@@ -1785,8 +2446,8 @@ if __name__ == "__main__":
                 gt_node = content["gt"]["nodes"]
                 gt_link = content["gt"]["links"]
             
-            node_f1 = f1_score(pred_node, gt_node)
-            link_f1 = f1_score(pred_link, gt_link)
+            node_f1 = compute_f1_set_based(pred_node, gt_node)
+            link_f1 = compute_f1_set_based(pred_link, gt_link)
             acc = float(node_f1 > 0.99 and link_f1 > 0.99)
             
             node_f1_list.append(node_f1)
@@ -1805,4 +2466,108 @@ if __name__ == "__main__":
 
     print('\n## Finishing Time:', get_cur_time(), flush=True)
     print('= ' * 20)
+
+    # 在 print(table) 之前添加：
+    import json
+
+    output_result_file = f"./prediction/{args.dataset}/{base_llm}/gcm_refined.json"
+    os.makedirs(os.path.dirname(output_result_file), exist_ok=True)
+
+    # 新增：准备正确和错误预测的文件路径
+    correct_pred_file = f"./prediction/{args.dataset}/{base_llm}/correct_predictions.json"
+    incorrect_pred_file = f"./prediction/{args.dataset}/{base_llm}/incorrect_predictions.json"
+
+    correct_predictions = []
+    incorrect_predictions = []
+
+    with open(output_result_file, 'w') as f:
+        for data_id in test_ids:
+            if data_id in final_pred_dict:
+                content = final_pred_dict[data_id]
+
+                # 获取预测结果和真实结果
+                pred_nodes = content["refined"]["nodes"]
+                pred_links = content["refined"]["links"]
+                gt_nodes = content["gt"]["nodes"]
+                gt_links = content["gt"]["links"]
+
+                # 使用与源代码完全相同的计算方法
+                node_f1 = compute_f1_set_based(pred_nodes, gt_nodes)
+                link_f1 = compute_f1_set_based(pred_links, gt_links)
+                # 与源代码一致：acc = float(node_f1 > 0.99 and link_f1 > 0.99)
+                is_correct = float(node_f1 > 0.99 and link_f1 > 0.99)
+
+                record = {
+                    "id": data_id,
+                    "user_request": content["user_request"],
+                    "pred_task_nodes": pred_nodes,
+                    "pred_task_links": pred_links,
+                    "direct_S": content["direct"]["S"],
+                    "strategy": content.get("strategy", "unknown")
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                # 根据预测是否正确，分别保存到不同的列表
+                if is_correct:
+                    correct_record = {
+                        "id": data_id,
+                        "user_request": content["user_request"],
+                        "pred_task_nodes": pred_nodes,
+                        "pred_task_links": pred_links,
+                        "gt_task_nodes": gt_nodes,
+                        "gt_task_links": gt_links,
+                        "node_f1": node_f1,
+                        "link_f1": link_f1,
+                        "direct_S": content["direct"]["S"],
+                        "strategy": content.get("strategy", "unknown")
+                    }
+                    correct_predictions.append(correct_record)
+                else:
+                    incorrect_record = {
+                        "id": data_id,
+                        "user_request": content["user_request"],
+                        "pred_task_nodes": pred_nodes,
+                        "pred_task_links": pred_links,
+                        "gt_task_nodes": gt_nodes,
+                        "gt_task_links": gt_links,
+                        "node_f1": node_f1,
+                        "link_f1": link_f1,
+                        "direct_S": content["direct"]["S"],
+                        "strategy": content.get("strategy", "unknown"),
+                        "error_analysis": {
+                            "missing_nodes": list(set(gt_nodes) - set(pred_nodes)),
+                            "extra_nodes": list(set(pred_nodes) - set(gt_nodes)),
+                            "missing_links": list(set(gt_links) - set(pred_links)),
+                            "extra_links": list(set(pred_links) - set(gt_links))
+                        }
+                    }
+                    incorrect_predictions.append(incorrect_record)
+
+    # 保存正确预测的文件 - 使用与源代码相同的准确率计算
+    total_samples = len(correct_predictions) + len(incorrect_predictions)
+    avg_acc = sum([1.0 for _ in correct_predictions]) / total_samples if total_samples > 0 else 0.0
+
+    with open(correct_pred_file, 'w', encoding='utf-8') as f:
+        json.dump({
+            "total_correct": len(correct_predictions),
+            "total_samples": total_samples,
+            "accuracy": avg_acc,
+            "predictions": correct_predictions
+        }, f, ensure_ascii=False, indent=2)
+
+    # 保存错误预测的文件
+    with open(incorrect_pred_file, 'w', encoding='utf-8') as f:
+        json.dump({
+            "total_incorrect": len(incorrect_predictions),
+            "total_samples": total_samples,
+            "error_rate": len(incorrect_predictions) / total_samples if total_samples > 0 else 0,
+            "predictions": incorrect_predictions
+        }, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved refined results to: {output_result_file}")
+    print(f"Saved correct predictions ({len(correct_predictions)}) to: {correct_pred_file}")
+    print(f"Saved incorrect predictions ({len(incorrect_predictions)}) to: {incorrect_pred_file}")
+
+    print("Done!")
+
     print("Done!")
