@@ -3,14 +3,15 @@
 # ==============================
 # Set your OpenAI API information
 # ==============================
-export OPENAI_API_KEY="your_openai_api_key_here"
-export OPENAI_API_BASE="your_openai_api_base_here"
+export HF_ENDPOINT=https://hf-mirror.com
+# env | grep -i proxy
+# unset ALL_PROXY all_proxy
 
 # ==============================
 # Configurable parameters
 # ==============================
 
-LLM_NAME="gpt-4o"
+LLM_NAME="deepseek-chat"
 DATASET="huggingface"
 
 # Training hyperparameters (modifiable)
@@ -43,5 +44,4 @@ python3 main.py \
     --lambda_gap ${LAMBDA_GAP} \
     --cost_tau ${COST_TAU} \
     --llm_name ${LLM_NAME}
-
 echo "========== All tasks finished =========="
