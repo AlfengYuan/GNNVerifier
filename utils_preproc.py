@@ -987,110 +987,6 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
             })
             return True
 
-        def try_insert():
-            nonlocal instances, total_cost, next_inst_id
-            if len(instances) < 1:
-                return False
-
-            pos = rng.randint(0, len(instances))
-
-            prev_tool = instances[pos-1]["tool"] if pos > 0 else None
-            next_tool = instances[pos]["tool"] if pos < len(instances) else None
-
-            # Find IO-compatible tools not already in chain
-            used_tools = set(inst["tool"] for inst in instances)
-            candidates = []
-
-            req_emb = None
-            if user_request:
-                try:
-                    req_emb = embedding_cache.encode_texts([user_request], prefix="query")[0]
-                except Exception:
-                    req_emb = None
-
-            for tid in meta_map:
-                if tid in used_tools:
-                    continue
-                if not can_connect(prev_tool, tid, next_tool):
-                    continue
-
-                try:
-                    t_emb = tool_embs.get(tid)
-                    if t_emb is None:
-                        t_desc = tool_descs.get(tid, tid)
-                        t_emb = embedding_cache.encode_texts([t_desc], prefix="passage")[0]
-                        tool_embs[tid] = t_emb
-                    if req_emb is not None:
-                        sim = float(np.dot(t_emb, req_emb))
-                    else:
-                        sim = 0.0
-                except Exception:
-                    sim = 0.0
-                candidates.append((tid, sim))
-
-            if not candidates:
-                return False
-
-            # Mix: 70% pick low-sim (obvious errors), 30% high-sim (hard negatives)
-            candidates.sort(key=lambda x: x[1])
-            n_low = max(1, len(candidates) // 2)
-            if rng.random() < 0.7:
-                pool = candidates[:n_low]
-            else:
-                pool = candidates[n_low:] if len(candidates) > n_low else candidates
-
-            t_insert = rng.choice(pool)[0]
-
-            prev_inst_id = instances[pos-1]["inst_id"] if pos > 0 else None
-            next_inst_id_val = instances[pos]["inst_id"] if pos < len(instances) else None
-
-            new_inst = {
-                "inst_id": next_inst_id,
-                "tool": t_insert,
-                "step": tool_descs.get(t_insert, t_insert),
-                "is_compress_inserted": False
-            }
-            next_inst_id += 1
-
-            instances.insert(pos, new_inst)
-
-            # Inserted tool is wrong
-            node_pos_ids.add(new_inst["inst_id"])
-
-            # Mark sequential edges around insertion point
-            if prev_inst_id is not None:
-                gap_pos_pairs.append((prev_inst_id, new_inst["inst_id"]))
-            else:
-                gap_pos_pairs.append((None, new_inst["inst_id"]))
-            if next_inst_id_val is not None:
-                gap_pos_pairs.append((new_inst["inst_id"], next_inst_id_val))
-
-            # Cost: more relevant tool → harder to detect → higher cost
-            try:
-                t_emb = tool_embs.get(t_insert)
-                if t_emb is None:
-                    t_desc = tool_descs.get(t_insert, t_insert)
-                    t_emb = embedding_cache.encode_texts([t_desc], prefix="passage")[0]
-                    tool_embs[t_insert] = t_emb
-                if req_emb is not None:
-                    sim = float(np.dot(t_emb, req_emb))
-                    tilde_r = (sim + 1.0) / 2.0
-                else:
-                    tilde_r = 0.5
-            except Exception:
-                tilde_r = 0.5
-            cost = max(0.05, 0.3 + 0.3 * tilde_r)
-            total_cost += cost
-
-            applied_ops.append({
-                "type": "INSERT",
-                "inst_id": new_inst["inst_id"],
-                "inserted": t_insert,
-                "position": pos,
-                "cost": float(cost)
-            })
-            return True
-
         for op_type in desired_op_types:
             op_success = False
             if op_type == "CONFUSION":
@@ -1140,9 +1036,6 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
                     continue
             elif op_type == "SWAP":
                 if not all(iid in inst_id_to_pos for iid in op.get("inst_ids", [])):
-                    continue
-            elif op_type == "INSERT":
-                if op.get("inst_id") not in inst_id_to_pos:
                     continue
             valid_ops.append(op)
             total_cost += float(op.get("cost", 0.0))
