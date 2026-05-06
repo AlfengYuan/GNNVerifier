@@ -440,7 +440,7 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
         embedding_cache.precompute_tool_embeddings(tool_meta)
         tool_embs = embedding_cache.get_all_tool_embeddings()
 
-    K = rng.choices([2, 3, 4], weights=[0.25, 0.50, 0.25], k=1)[0]
+    K = rng.choices([3, 5, 7], weights=[0.30, 0.45, 0.25], k=1)[0]
     
     generated_tools_set = set()
     generated_tools_set.add(tuple(gt_tools))
@@ -470,18 +470,16 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
         node_pos_ids = set()
         gap_pos_pairs = []
 
-        B = rng.choices([1, 2, 3], weights=[0.60, 0.30, 0.10], k=1)[0]
+        B = rng.choices([1, 2, 3], weights=[0.30, 0.45, 0.25], k=1)[0]
         desired_op_types = []
+        all_ops = ["CONFUSION", "MISSING", "SWAP"]
         if B == 1:
-            desired_op_types = ["CONFUSION" if rng.random() < 0.5 else "MISSING"]
+            desired_op_types = [rng.choice(all_ops)]
         elif B == 2:
-            desired_op_types = ["CONFUSION", "MISSING"]
+            desired_op_types = list(rng.sample(all_ops, 2))
             rng.shuffle(desired_op_types)
         else:
-            if rng.random() < 0.5:
-                desired_op_types = ["CONFUSION", "CONFUSION", "MISSING"]
-            else:
-                desired_op_types = ["CONFUSION", "MISSING", "MISSING"]
+            desired_op_types = list(all_ops)
             rng.shuffle(desired_op_types)
         
         def try_confusion():
@@ -903,17 +901,210 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
                         return True
             
             return False
-        
+
+        def try_swap():
+            nonlocal instances, total_cost
+            if len(instances) < 2 or not tool_embs:
+                return False
+
+            candidates = []
+            for i in range(len(instances) - 1):
+                if instances[i]["inst_id"] in node_pos_ids or instances[i+1]["inst_id"] in node_pos_ids:
+                    continue
+                if instances[i].get("is_compress_inserted") or instances[i+1].get("is_compress_inserted"):
+                    continue
+                if instances[i]["tool"] == instances[i+1]["tool"]:
+                    continue
+
+                prev_tool = instances[i-1]["tool"] if i > 0 else None
+                tool_a, tool_b = instances[i]["tool"], instances[i+1]["tool"]
+                next_tool = instances[i+2]["tool"] if i+2 < len(instances) else None
+
+                if not can_connect(prev_tool, tool_b, tool_a):
+                    continue
+                if not can_connect(tool_b, tool_a, next_tool):
+                    continue
+
+                try:
+                    a_emb = tool_embs.get(tool_a)
+                    b_emb = tool_embs.get(tool_b)
+                    if a_emb is not None and b_emb is not None:
+                        sim = float(np.dot(a_emb, b_emb))
+                    else:
+                        sim = 0.0
+                except Exception:
+                    sim = 0.0
+                weight = max(sim, 0.01)
+                candidates.append((i, weight))
+
+            if not candidates:
+                return False
+
+            positions = [c[0] for c in candidates]
+            weights = [c[1] for c in candidates]
+            i = rng.choices(positions, weights=weights, k=1)[0]
+
+            inst_a_id = instances[i]["inst_id"]
+            inst_b_id = instances[i+1]["inst_id"]
+            tool_a = instances[i]["tool"]
+            tool_b = instances[i+1]["tool"]
+
+            # Only swap tools, NOT steps (creates tool-step mismatch signal like CONFUSION)
+            instances[i]["tool"] = tool_b
+            instances[i+1]["tool"] = tool_a
+
+            # Both positions have wrong tools
+            node_pos_ids.add(inst_a_id)
+            node_pos_ids.add(inst_b_id)
+
+            # Mark affected SEQUENTIAL edges (must exist in the graph's forward edge list)
+            if i > 0:
+                gap_pos_pairs.append((instances[i-1]["inst_id"], instances[i]["inst_id"]))
+            gap_pos_pairs.append((instances[i]["inst_id"], instances[i+1]["inst_id"]))
+            if i + 2 < len(instances):
+                gap_pos_pairs.append((instances[i+1]["inst_id"], instances[i+2]["inst_id"]))
+
+            # Cost based on embedding similarity (similar tools → harder negative → lower cost)
+            try:
+                a_emb = tool_embs.get(tool_a)
+                b_emb = tool_embs.get(tool_b)
+                if a_emb is not None and b_emb is not None:
+                    sim = float(np.dot(a_emb, b_emb))
+                else:
+                    sim = 0.0
+            except Exception:
+                sim = 0.0
+            tilde_sim = (sim + 1.0) / 2.0
+            cost = max(0.05, 0.35 * (1.0 - tilde_sim))
+            total_cost += cost
+
+            applied_ops.append({
+                "type": "SWAP",
+                "inst_ids": [inst_a_id, inst_b_id],
+                "original": [tool_a, tool_b],
+                "swapped": [tool_b, tool_a],
+                "cost": float(cost)
+            })
+            return True
+
+        def try_insert():
+            nonlocal instances, total_cost, next_inst_id
+            if len(instances) < 1:
+                return False
+
+            pos = rng.randint(0, len(instances))
+
+            prev_tool = instances[pos-1]["tool"] if pos > 0 else None
+            next_tool = instances[pos]["tool"] if pos < len(instances) else None
+
+            # Find IO-compatible tools not already in chain
+            used_tools = set(inst["tool"] for inst in instances)
+            candidates = []
+
+            req_emb = None
+            if user_request:
+                try:
+                    req_emb = embedding_cache.encode_texts([user_request], prefix="query")[0]
+                except Exception:
+                    req_emb = None
+
+            for tid in meta_map:
+                if tid in used_tools:
+                    continue
+                if not can_connect(prev_tool, tid, next_tool):
+                    continue
+
+                try:
+                    t_emb = tool_embs.get(tid)
+                    if t_emb is None:
+                        t_desc = tool_descs.get(tid, tid)
+                        t_emb = embedding_cache.encode_texts([t_desc], prefix="passage")[0]
+                        tool_embs[tid] = t_emb
+                    if req_emb is not None:
+                        sim = float(np.dot(t_emb, req_emb))
+                    else:
+                        sim = 0.0
+                except Exception:
+                    sim = 0.0
+                candidates.append((tid, sim))
+
+            if not candidates:
+                return False
+
+            # Mix: 70% pick low-sim (obvious errors), 30% high-sim (hard negatives)
+            candidates.sort(key=lambda x: x[1])
+            n_low = max(1, len(candidates) // 2)
+            if rng.random() < 0.7:
+                pool = candidates[:n_low]
+            else:
+                pool = candidates[n_low:] if len(candidates) > n_low else candidates
+
+            t_insert = rng.choice(pool)[0]
+
+            prev_inst_id = instances[pos-1]["inst_id"] if pos > 0 else None
+            next_inst_id_val = instances[pos]["inst_id"] if pos < len(instances) else None
+
+            new_inst = {
+                "inst_id": next_inst_id,
+                "tool": t_insert,
+                "step": tool_descs.get(t_insert, t_insert),
+                "is_compress_inserted": False
+            }
+            next_inst_id += 1
+
+            instances.insert(pos, new_inst)
+
+            # Inserted tool is wrong
+            node_pos_ids.add(new_inst["inst_id"])
+
+            # Mark sequential edges around insertion point
+            if prev_inst_id is not None:
+                gap_pos_pairs.append((prev_inst_id, new_inst["inst_id"]))
+            else:
+                gap_pos_pairs.append((None, new_inst["inst_id"]))
+            if next_inst_id_val is not None:
+                gap_pos_pairs.append((new_inst["inst_id"], next_inst_id_val))
+
+            # Cost: more relevant tool → harder to detect → higher cost
+            try:
+                t_emb = tool_embs.get(t_insert)
+                if t_emb is None:
+                    t_desc = tool_descs.get(t_insert, t_insert)
+                    t_emb = embedding_cache.encode_texts([t_desc], prefix="passage")[0]
+                    tool_embs[t_insert] = t_emb
+                if req_emb is not None:
+                    sim = float(np.dot(t_emb, req_emb))
+                    tilde_r = (sim + 1.0) / 2.0
+                else:
+                    tilde_r = 0.5
+            except Exception:
+                tilde_r = 0.5
+            cost = max(0.05, 0.3 + 0.3 * tilde_r)
+            total_cost += cost
+
+            applied_ops.append({
+                "type": "INSERT",
+                "inst_id": new_inst["inst_id"],
+                "inserted": t_insert,
+                "position": pos,
+                "cost": float(cost)
+            })
+            return True
+
         for op_type in desired_op_types:
             op_success = False
             if op_type == "CONFUSION":
                 op_success = try_confusion()
                 if not op_success:
-                    op_success = try_missing() or try_missing()
+                    op_success = try_swap() or try_missing()
+            elif op_type == "SWAP":
+                op_success = try_swap()
+                if not op_success:
+                    op_success = try_confusion()
             else:
                 op_success = try_missing() or try_missing()
                 if not op_success:
-                    op_success = try_confusion()
+                    op_success = try_swap() or try_confusion()
             if not op_success:
                 break
         
@@ -942,9 +1133,16 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
         valid_ops = []
         total_cost = 0.0
         for op in applied_ops:
-            if op.get("type") == "CONFUSION":
+            op_type = op.get("type")
+            if op_type == "CONFUSION":
                 inst_id = op.get("inst_id")
                 if inst_id not in inst_id_to_pos:
+                    continue
+            elif op_type == "SWAP":
+                if not all(iid in inst_id_to_pos for iid in op.get("inst_ids", [])):
+                    continue
+            elif op_type == "INSERT":
+                if op.get("inst_id") not in inst_id_to_pos:
                     continue
             valid_ops.append(op)
             total_cost += float(op.get("cost", 0.0))

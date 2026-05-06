@@ -549,7 +549,7 @@ client = OpenAI(api_key=_api_key, base_url=_api_base_url)
 
 # 核心阈值参数
 TAU_ACCEPT = 0.9           # 接受阈值：GNN分数≥此值直接接受
-DELTA_IMPROVE = 0.02       # 改进阈值：新计划必须比原计划好至少此值
+DELTA_IMPROVE = 0.02       # 改进阈值基数：实际阈值 = DELTA_IMPROVE × base_S（低分计划降低门槛）
 THETA_NODE = 0.5           # 节点风险阈值（默认）
 THETA_GAP = 0.5            # 间隙风险阈值（默认）
 
@@ -1592,7 +1592,8 @@ def iterative_refine_with_llm(controller, user_request, init_plan, init_gnn,
     candidates.sort(key=lambda x: x[0], reverse=True)
     final_S, final_plan, final_gnn, final_strategy = candidates[0]
 
-    if final_S < base_S + DELTA_IMPROVE:
+    adaptive_delta = DELTA_IMPROVE * base_S
+    if final_S < base_S + adaptive_delta:
         final_plan = init_plan
         final_strategy = "rollback"
     
