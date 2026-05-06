@@ -472,14 +472,14 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
 
         B = rng.choices([1, 2, 3], weights=[0.30, 0.45, 0.25], k=1)[0]
         desired_op_types = []
-        all_ops = ["CONFUSION", "MISSING", "SWAP"]
+        all_ops = ["CONFUSION", "MISSING", "SWAP", "INSERT"]
         if B == 1:
             desired_op_types = [rng.choice(all_ops)]
         elif B == 2:
             desired_op_types = list(rng.sample(all_ops, 2))
             rng.shuffle(desired_op_types)
         else:
-            desired_op_types = list(all_ops)
+            desired_op_types = list(rng.sample(all_ops, min(B, len(all_ops))))
             rng.shuffle(desired_op_types)
         
         def try_confusion():
@@ -1101,6 +1101,10 @@ def generate_perturbations_with_labels(gt_ex, confusion, tool_meta, typed_ngrams
                 op_success = try_swap()
                 if not op_success:
                     op_success = try_confusion()
+            elif op_type == "INSERT":
+                op_success = try_insert()
+                if not op_success:
+                    op_success = try_missing() or try_confusion()
             else:
                 op_success = try_missing() or try_missing()
                 if not op_success:
